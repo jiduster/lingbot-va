@@ -1,10 +1,12 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.datasets.utils import get_episode_data_index
+from lerobot.datasets.utils import get_episode_data_index, get_safe_version
 from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
+from datasets import load_dataset
+import json
 import numpy as np
+import packaging.version
 from pathlib import Path
-from collections.abc import Callable
 import os
 from tqdm import tqdm
 from multiprocessing import Pool
@@ -12,8 +14,184 @@ from functools import partial
 import torch
 from einops import rearrange
 from torch.utils.data import DataLoader
-from scipy.spatial.transform import Rotation as R
 from lerobot.constants import HF_LEROBOT_HOME
+
+
+def _read_jsonl(path):
+    rows = []
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def _is_local_lerobot_v3(root):
+    info_path = Path(root) / "meta" / "info.json"
+    if not info_path.exists():
+        return False
+    with open(info_path, "r") as f:
+        info = json.load(f)
+    version = str(info.get("codebase_version", "")).lstrip("v")
+    try:
+        return packaging.version.parse(version).major >= 3
+    except packaging.version.InvalidVersion:
+        return False
+
+
+class LocalLeRobotV3Metadata:
+    """Small compatibility layer for local LeRobot v3 datasets.
+
+    LingBot-VA uses LeRobot 0.3.x/v2.1 APIs, while v3 datasets store episode
+    metadata in parquet shards and use data_path placeholders named
+    chunk_index/file_index. This adapter exposes the subset used by the
+    LingBot-VA latent dataset loader.
+    """
+
+    def __init__(self, repo_id, root):
+        self.repo_id = repo_id
+        self.root = Path(root)
+        with open(self.root / "meta" / "info.json", "r") as f:
+            self.info = json.load(f)
+        self.tasks, self.task_to_task_index = self._load_tasks()
+        self.episodes = self._load_episodes()
+        self.stats = self._load_stats()
+        self.episodes_stats = {
+            ep_idx: self.stats for ep_idx in self.episodes
+        } if self.stats is not None else {}
+
+    @property
+    def _version(self):
+        return packaging.version.parse(str(self.info["codebase_version"]).lstrip("v"))
+
+    @property
+    def data_path(self):
+        return self.info["data_path"]
+
+    @property
+    def video_path(self):
+        return self.info.get("video_path")
+
+    @property
+    def features(self):
+        return self.info["features"]
+
+    @property
+    def chunks_size(self):
+        return self.info.get("chunks_size", 1000)
+
+    @property
+    def total_episodes(self):
+        return self.info["total_episodes"]
+
+    @property
+    def video_keys(self):
+        return [key for key, ft in self.features.items() if ft["dtype"] == "video"]
+
+    def _load_tasks(self):
+        jsonl_path = self.root / "meta" / "tasks.jsonl"
+        if jsonl_path.exists():
+            rows = _read_jsonl(jsonl_path)
+        else:
+            import pyarrow.parquet as pq
+
+            rows = pq.read_table(self.root / "meta" / "tasks.parquet").to_pylist()
+        tasks = {
+            int(row["task_index"]): row["task"]
+            for row in sorted(rows, key=lambda item: item["task_index"])
+        }
+        return tasks, {task: task_index for task_index, task in tasks.items()}
+
+    def _read_v3_episode_rows(self):
+        import pyarrow.parquet as pq
+
+        episode_files = sorted((self.root / "meta" / "episodes").glob("**/*.parquet"))
+        rows = []
+        wanted_columns = [
+            "episode_index",
+            "tasks",
+            "length",
+            "data/chunk_index",
+            "data/file_index",
+            "dataset_from_index",
+            "dataset_to_index",
+            "meta/episodes/chunk_index",
+            "meta/episodes/file_index",
+        ]
+        for path in episode_files:
+            names = pq.ParquetFile(path).schema_arrow.names
+            columns = [name for name in wanted_columns if name in names]
+            rows.extend(pq.read_table(path, columns=columns).to_pylist())
+        return rows
+
+    def _load_episodes(self):
+        jsonl_path = self.root / "meta" / "episodes.jsonl"
+        if jsonl_path.exists():
+            rows = _read_jsonl(jsonl_path)
+        else:
+            rows = self._read_v3_episode_rows()
+
+        episodes = {}
+        for row in sorted(rows, key=lambda item: item["episode_index"]):
+            row = dict(row)
+            row["episode_index"] = int(row["episode_index"])
+            row["length"] = int(row["length"])
+            tasks = row.get("tasks") or []
+            if isinstance(tasks, str):
+                tasks = [tasks]
+            row["tasks"] = tasks
+            if not row.get("action_config"):
+                action_text = tasks[0] if tasks else ""
+                row["action_config"] = [{
+                    "start_frame": 0,
+                    "end_frame": row["length"],
+                    "action_text": action_text,
+                }]
+            episodes[row["episode_index"]] = row
+        return episodes
+
+    def _load_stats(self):
+        stats_path = self.root / "meta" / "stats.json"
+        if not stats_path.exists():
+            return None
+        with open(stats_path, "r") as f:
+            stats = json.load(f)
+        return {
+            feature: {
+                stat_name: np.asarray(value)
+                for stat_name, value in feature_stats.items()
+            }
+            for feature, feature_stats in stats.items()
+            if isinstance(feature_stats, dict)
+        }
+
+    def get_episode_chunk(self, ep_index):
+        row = self.episodes[int(ep_index)]
+        return int(row.get("data/chunk_index", ep_index // self.chunks_size))
+
+    def get_data_file_path(self, ep_index):
+        row = self.episodes[int(ep_index)]
+        episode_chunk = self.get_episode_chunk(ep_index)
+        data_file_index = int(row.get("data/file_index", ep_index))
+        return Path(self.data_path.format(
+            episode_chunk=episode_chunk,
+            episode_index=int(ep_index),
+            chunk_index=episode_chunk,
+            file_index=data_file_index,
+        ))
+
+    def get_video_file_path(self, ep_index, vid_key):
+        if self.video_path is None:
+            return None
+        episode_chunk = self.get_episode_chunk(ep_index)
+        return Path(self.video_path.format(
+            episode_chunk=episode_chunk,
+            episode_index=int(ep_index),
+            video_key=vid_key,
+            chunk_index=episode_chunk,
+            file_index=int(ep_index),
+        ))
 
 def recursive_find_file(directory, filename='info.json'):
     result = []
@@ -40,19 +218,23 @@ def construct_lerobot(
 def construct_lerobot_multi_processor(config, 
                                       num_init_worker=8,
                                       ):
-    datasets_out_lst = []
     construct_func = partial(
         construct_lerobot,
         config=config,
     )
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
     repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
+    if len(repo_list) == 1:
+        return [construct_func(repo_list[0])]
+    num_init_worker = min(num_init_worker, max(1, len(repo_list)))
     with Pool(num_init_worker) as pool:
         datasets_out_lst = pool.map(construct_func, repo_list)
                 
     return datasets_out_lst
 
 def get_relative_pose(pose):
+    from scipy.spatial.transform import Rotation as R
+
     if torch.is_tensor(pose):
         pose = pose.detach().cpu().numpy()
     
@@ -112,7 +294,8 @@ class LatentLeRobotDataset(LeRobotDataset):
         config=None,
     ):
         self.repo_id = repo_id
-        self.root = HF_LEROBOT_HOME / repo_id
+        repo_path = Path(repo_id)
+        self.root = repo_path if repo_path.is_absolute() else HF_LEROBOT_HOME / repo_id
         self.image_transforms = None
         self.delta_timestamps = None
         self.episodes = None
@@ -125,23 +308,29 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.image_writer = None
         self.episode_buffer = None
         self.root.mkdir(exist_ok=True, parents=True)
-        self.meta = LeRobotDatasetMetadata(
-            self.repo_id, self.root, self.revision, force_cache_sync=False
-        )
-        if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1"):
-            episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
-            self.stats = aggregate_stats(episodes_stats)
-        
-        try:
-            assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
+        self._use_local_v3 = _is_local_lerobot_v3(self.root)
+        if self._use_local_v3:
+            self.meta = LocalLeRobotV3Metadata(self.repo_id, self.root)
+            self.stats = self.meta.stats
             self.hf_dataset = self.load_hf_dataset()
-        except (AssertionError, FileNotFoundError, NotADirectoryError):
-            self.revision = get_safe_version(self.repo_id, self.revision)
-            self.download_episodes(download_videos)
-            self.hf_dataset = self.load_hf_dataset()
+        else:
+            self.meta = LeRobotDatasetMetadata(
+                self.repo_id, self.root, self.revision, force_cache_sync=False
+            )
+            if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1"):
+                episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
+                self.stats = aggregate_stats(episodes_stats)
+            
+            try:
+                assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
+                self.hf_dataset = self.load_hf_dataset()
+            except (AssertionError, FileNotFoundError, NotADirectoryError):
+                self.revision = get_safe_version(self.repo_id, self.revision)
+                self.download_episodes(download_videos=False)
+                self.hf_dataset = self.load_hf_dataset()
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
         
-        self.latent_path = Path(repo_id) / 'latents'
+        self.latent_path = self.root / 'latents'
         self.empty_emb = torch.load(config.empty_emb_path, weights_only=False)
         self.config = config
         self.cfg_prob = config.cfg_prob
@@ -154,6 +343,30 @@ class LatentLeRobotDataset(LeRobotDataset):
                 output_all_columns=False
             )
         self.parse_meta()
+
+    def get_episodes_file_paths(self):
+        if not self._use_local_v3:
+            return super().get_episodes_file_paths()
+        episodes = self.episodes if self.episodes is not None else list(self.meta.episodes)
+        fpaths = [self.meta.get_data_file_path(ep_idx) for ep_idx in episodes]
+        for ep_idx in episodes:
+            for vid_key in self.meta.video_keys:
+                video_path = self.meta.get_video_file_path(ep_idx, vid_key)
+                if video_path is not None:
+                    fpaths.append(video_path)
+        return fpaths
+
+    def load_hf_dataset(self):
+        if not getattr(self, "_use_local_v3", False):
+            return super().load_hf_dataset()
+
+        if self.episodes is None:
+            path = str(self.root / "data")
+            hf_dataset = load_dataset("parquet", data_dir=path, split="train")
+        else:
+            files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
+            hf_dataset = load_dataset("parquet", data_files=files, split="train")
+        return hf_dataset
 
     def parse_meta(self):
         out = []
