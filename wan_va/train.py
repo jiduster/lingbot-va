@@ -144,6 +144,12 @@ class Trainer:
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
         self.train_loader_iter = None
+        self.enable_fdm_training = getattr(config, 'enable_fdm_training', False)
+        self.fdm_prob = getattr(config, 'fdm_prob', 0.5)
+        self.dyn_loss_weight = getattr(config, 'dyn_loss_weight', 1.0)
+        self.idm_loss_weight = getattr(config, 'idm_loss_weight', 1.0)
+        self.fdm_loss_weight = getattr(config, 'fdm_loss_weight', 1.0)
+        self.idm_include_dyn_loss = getattr(config, 'idm_include_dyn_loss', True)
         # if hasattr(config, 'resume_from') and config.resume_from:
         #     self._load_training_state(config.resume_from)
     
@@ -162,6 +168,30 @@ class Trainer:
             batch = next(self.train_loader_iter)
         
         return batch
+
+    @torch.no_grad()
+    def _sample_loss_mode(self):
+        if not self.enable_fdm_training:
+            return 'default'
+        return 'fdm' if torch.rand(1).item() < self.fdm_prob else 'idm'
+
+    @torch.no_grad()
+    def _mean_active_loss(self, losses):
+        """Reduce a list of scalar losses across accumulation steps and ranks."""
+        if len(losses) > 0:
+            loss_sum = torch.stack(losses).float().sum()
+            loss_count = loss_sum.new_tensor(float(len(losses)))
+        else:
+            loss_sum = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+            loss_count = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+
+        stats = torch.stack([loss_sum, loss_count])
+        if dist.is_initialized():
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+        if stats[1].item() <= 0:
+            return None
+        return (stats[0] / stats[1]).detach().cpu().item()
 
     @torch.no_grad()
     def _add_noise(self, latent, train_scheduler, action_mask=False, action_mode=False, noisy_cond_prob=0.):
@@ -269,13 +299,30 @@ class Trainer:
         # Frame-wise video loss calculation
         latent_loss = F.mse_loss(latent_pred.float(), input_dict['latent_dict']['targets'].float().detach(), reduction='none')
         latent_loss = latent_loss * latent_loss_weight[:, None, :, None, None]
+        latent_loss_mask = torch.ones_like(latent_loss)
+        if input_dict.get('loss_mode') == 'fdm':
+            num_frames = latent_loss.shape[2]
+            chunk_size = min(input_dict['chunk_size'], num_frames)
+            if num_frames > chunk_size:
+                frame_mask = torch.arange(
+                    num_frames,
+                    device=latent_loss.device,
+                ) >= chunk_size
+                latent_loss_mask = latent_loss_mask * frame_mask.view(1, 1, -1, 1, 1)
+                latent_loss = latent_loss * latent_loss_mask
         # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)
         latent_loss = latent_loss.permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
+        latent_loss_mask = latent_loss_mask.permute(0, 2, 3, 4, 1)
         latent_loss = latent_loss.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
+        latent_loss_mask = latent_loss_mask.flatten(0, 1).flatten(1)
         # Sum per frame and compute mask per frame
         latent_loss_per_frame = latent_loss.sum(dim=1)  # (B*F,)
-        latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)  # (B*F,)
-        latent_loss = (latent_loss_per_frame / (latent_mask_per_frame + 1e-6)).mean()
+        latent_mask_per_frame = latent_loss_mask.sum(dim=1)  # (B*F,)
+        valid_latent_frames = latent_mask_per_frame > 0
+        latent_loss = (
+            latent_loss_per_frame[valid_latent_frames] /
+            (latent_mask_per_frame[valid_latent_frames] + 1e-6)
+        ).mean()
 
         # Frame-wise action loss calculation
         action_loss = F.mse_loss(action_pred.float(), input_dict['action_dict']['targets'].float().detach(), reduction='none')
@@ -291,12 +338,53 @@ class Trainer:
         action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
         action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
 
-        return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps
+        return latent_loss, action_loss
+
+    def _combine_losses(self, input_dict, latent_loss, action_loss):
+        loss_mode = input_dict.get('loss_mode', 'default')
+        zero = latent_loss.detach() * 0.0
+
+        if loss_mode == 'fdm':
+            fdm_loss = self.fdm_loss_weight * latent_loss
+            loss = fdm_loss + action_loss * 0.0
+            return (
+                loss / self.gradient_accumulation_steps,
+                latent_loss,
+                zero,
+                loss_mode,
+                fdm_loss.detach(),
+            )
+
+        if loss_mode == 'idm':
+            if self.idm_include_dyn_loss:
+                idm_loss = self.dyn_loss_weight * latent_loss + self.idm_loss_weight * action_loss
+                logged_latent_loss = latent_loss
+            else:
+                idm_loss = self.idm_loss_weight * action_loss
+                logged_latent_loss = zero
+            loss = idm_loss
+            return (
+                loss / self.gradient_accumulation_steps,
+                logged_latent_loss,
+                action_loss,
+                loss_mode,
+                idm_loss.detach(),
+            )
+
+        loss = self.dyn_loss_weight * latent_loss + self.idm_loss_weight * action_loss
+        return (
+            loss / self.gradient_accumulation_steps,
+            latent_loss,
+            action_loss,
+            loss_mode,
+            loss.detach(),
+        )
 
     def _train_step(self, batch, batch_idx):
         """Train a single batch, returns losses for logging."""
         batch = self.convert_input_format(batch)
         input_dict = self._prepare_input_dict(batch)
+        input_dict['loss_mode'] = self._sample_loss_mode()
         
         should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
         
@@ -307,11 +395,22 @@ class Trainer:
 
         output = self.transformer(input_dict, train_mode=True)
         latent_loss, action_loss = self.compute_loss(input_dict, output)
-        loss = latent_loss + action_loss
+        loss, logged_latent_loss, logged_action_loss, loss_mode, branch_loss = self._combine_losses(
+            input_dict,
+            latent_loss,
+            action_loss,
+        )
 
         loss.backward()
 
-        losses = {'latent_loss': latent_loss.detach(), 'action_loss': action_loss.detach()}
+        losses = {
+            'latent_loss': logged_latent_loss.detach(),
+            'action_loss': logged_action_loss.detach(),
+            'raw_latent_loss': latent_loss.detach(),
+            'raw_action_loss': action_loss.detach(),
+            'branch_loss': branch_loss,
+            'loss_mode': loss_mode,
+        }
         
         # Only update weights after accumulating gradients
         if should_sync:
@@ -435,6 +534,12 @@ class Trainer:
         self.optimizer.zero_grad()
         accumulated_latent_losses = []
         accumulated_action_losses = []
+        accumulated_raw_latent_losses = []
+        accumulated_raw_action_losses = []
+        accumulated_fdm_losses = []
+        accumulated_idm_losses = []
+        accumulated_fdm_steps = 0
+        accumulated_idm_steps = 0
         step_in_accumulation = 0
 
         while self.step < self.config.num_steps:
@@ -446,6 +551,14 @@ class Trainer:
             # Accumulate losses for logging
             accumulated_latent_losses.append(losses['latent_loss'])
             accumulated_action_losses.append(losses['action_loss'])
+            accumulated_raw_latent_losses.append(losses['raw_latent_loss'])
+            accumulated_raw_action_losses.append(losses['raw_action_loss'])
+            if losses['loss_mode'] == 'fdm':
+                accumulated_fdm_steps += 1
+                accumulated_fdm_losses.append(losses['branch_loss'])
+            elif losses['loss_mode'] == 'idm':
+                accumulated_idm_steps += 1
+                accumulated_idm_losses.append(losses['branch_loss'])
             step_in_accumulation += 1
 
             # Log and checkpoint when optimizer steps
@@ -457,10 +570,22 @@ class Trainer:
                 action_loss_show = dist_mean(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
                 max_latent_loss_show = dist_max(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
                 max_action_loss_show = dist_max(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
+                raw_latent_loss_show = dist_mean(torch.stack(accumulated_raw_latent_losses).mean()).detach().cpu().item()
+                raw_action_loss_show = dist_mean(torch.stack(accumulated_raw_action_losses).mean()).detach().cpu().item()
+                fdm_loss_show = self._mean_active_loss(accumulated_fdm_losses)
+                idm_loss_show = self._mean_active_loss(accumulated_idm_losses)
+                fdm_steps_show = accumulated_fdm_steps
+                idm_steps_show = accumulated_idm_steps
 
                 # Clear accumulated losses
                 accumulated_latent_losses = []
                 accumulated_action_losses = []
+                accumulated_raw_latent_losses = []
+                accumulated_raw_action_losses = []
+                accumulated_fdm_losses = []
+                accumulated_idm_losses = []
+                accumulated_fdm_steps = 0
+                accumulated_idm_steps = 0
                 step_in_accumulation = 0
 
                 torch.cuda.synchronize()
@@ -474,19 +599,29 @@ class Trainer:
                     progress_bar.set_postfix({
                         'latent_loss': f'{latent_loss_show:.4f}',
                         'action_loss': f'{action_loss_show:.4f}',
+                        'fdm_loss': f'{fdm_loss_show:.4f}' if fdm_loss_show is not None else '--',
+                        'idm_loss': f'{idm_loss_show:.4f}' if idm_loss_show is not None else '--',
+                        'fdm/idm': f'{fdm_steps_show}/{idm_steps_show}',
                         'step': self.step,
                         'grad_norm': f'{total_norm.item():.2f}',
                         'lr': f'{lr:.2e}'
                     })
+                    wandb_log = {
+                        'loss_metrics/global_avg_video_loss': latent_loss_show,
+                        'loss_metrics/global_avg_action_loss': action_loss_show,
+                        'loss_metrics/global_max_video_loss': max_latent_loss_show,
+                        'loss_metrics/global_max_action_loss': max_action_loss_show,
+                        'loss_metrics/raw_video_loss': raw_latent_loss_show,
+                        'loss_metrics/raw_action_loss': raw_action_loss_show,
+                        'loss_metrics/fdm_loss': fdm_loss_show if fdm_loss_show is not None else float('nan'),
+                        'loss_metrics/idm_loss': idm_loss_show if idm_loss_show is not None else float('nan'),
+                        'loss_metrics/fdm_steps': fdm_steps_show,
+                        'loss_metrics/idm_steps': idm_steps_show,
+                        'grad_norm': total_norm.item(),
+                        'lr': lr,
+                    }
                     if self.config.enable_wandb:
-                        self.wandb.log({
-                            'loss_metrics/global_avg_video_loss': latent_loss_show,
-                            'loss_metrics/global_avg_action_loss': action_loss_show,
-                            'loss_metrics/global_max_video_loss': max_latent_loss_show,
-                            'loss_metrics/global_max_action_loss': max_action_loss_show,
-                            'grad_norm': total_norm.item(),
-                            'lr': lr,
-                        }, step=self.step)
+                        self.wandb.log(wandb_log, step=self.step)
                 
                 self.step += 1
                 

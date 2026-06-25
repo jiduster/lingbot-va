@@ -47,6 +47,7 @@ class VA_Server:
         self.dtype = job_config.param_dtype
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
+        self.profile_timings = bool(int(os.getenv("LINGBOT_VA_PROFILE_TIMINGS", "0")))
 
         self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
                                             sigma_min=0.0,
@@ -77,9 +78,30 @@ class VA_Server:
             torch_device='cpu' if self.enable_offload else self.device,
         )
 
+        transformer_override = getattr(job_config, 'transformer_checkpoint_path', None)
+        if transformer_override is not None:
+            if os.path.isfile(transformer_override):
+                transformer_path = transformer_override
+            elif os.path.isfile(
+                os.path.join(transformer_override, 'diffusion_pytorch_model.safetensors')
+            ):
+                transformer_path = transformer_override
+            elif os.path.isfile(
+                os.path.join(transformer_override, 'transformer', 'diffusion_pytorch_model.safetensors')
+            ):
+                transformer_path = os.path.join(transformer_override, 'transformer')
+            else:
+                transformer_path = os.path.join(transformer_override, 'transformer')
+            if job_config.rank == 0:
+                logger.info(f"Loading transformer from override path: {transformer_path}")
+        elif hasattr(job_config, 'resume_from') and job_config.resume_from:
+            transformer_path = os.path.join(job_config.resume_from, 'transformer')
+        else:
+            transformer_path = os.path.join(job_config.wan22_pretrained_model_name_or_path,
+                                            'transformer')
+
         self.transformer = load_transformer(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'transformer'),
+            transformer_path,
             torch_dtype=self.dtype,
             torch_device=self.device,
         )
@@ -102,6 +124,12 @@ class VA_Server:
             )
             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
 
+    def _log_timing(self, name, start_time, extra=None):
+        if self.profile_timings and self.job_config.rank == 0:
+            elapsed = time.perf_counter() - start_time
+            suffix = f" {extra}" if extra else ""
+            logger.info(f"[timing] {name}: {elapsed:.3f}s{suffix}")
+
     def _get_t5_prompt_embeds(
         self,
         prompt=None,
@@ -117,6 +145,7 @@ class VA_Server:
         prompt = [prompt_clean(u) for u in prompt]
         batch_size = len(prompt)
 
+        t_tokenize = time.perf_counter()
         text_inputs = self.tokenizer(
             prompt,
             padding="max_length",
@@ -128,8 +157,10 @@ class VA_Server:
         )
         text_input_ids, mask = text_inputs.input_ids, text_inputs.attention_mask
         seq_lens = mask.gt(0).sum(dim=1).long()
+        self._log_timing("t5_tokenize", t_tokenize, f"batch={batch_size} max_len={max_sequence_length}")
 
         text_encoder_device = next(self.text_encoder.parameters()).device
+        t_forward = time.perf_counter()
         prompt_embeds = self.text_encoder(text_input_ids.to(text_encoder_device),
                                           mask.to(text_encoder_device)).last_hidden_state
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
@@ -146,6 +177,7 @@ class VA_Server:
         prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt,
                                            seq_len, -1)
+        self._log_timing("t5_forward", t_forward, f"device={text_encoder_device}")
 
         return prompt_embeds.to(device)
 
@@ -322,6 +354,7 @@ class VA_Server:
         return input_dict
 
     def _encode_obs(self, obs):
+        t_start = time.perf_counter()
         images = obs['obs']
         if not isinstance(images, list):
             images = [images]
@@ -371,9 +404,12 @@ class VA_Server:
         latents_std = torch.tensor(self.vae.config.latents_std).to(mu.device)
         mu_norm = self.normalize_latents(mu, latents_mean, 1.0 / latents_std)
         video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-1)
-        return video_latent.to(self.device)
+        video_latent = video_latent.to(self.device)
+        self._log_timing("encode_obs", t_start, f"cams={len(self.job_config.obs_cam_keys)}")
+        return video_latent
 
     def _reset(self, prompt=None):
+        t_start = time.perf_counter()
         logger.info('Reset.')
         self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
         #### Reset all parameters
@@ -400,6 +436,7 @@ class VA_Server:
                                       patch_size[0] * patch_size[1] *
                                       patch_size[2])
         action_token_per_chunk = self.job_config.frame_chunk_size * self.action_per_frame
+        t_cache = time.perf_counter()
         self.transformer.create_empty_cache(self.cache_name,
                                             self.job_config.attn_window,
                                             latent_token_per_chunk,
@@ -408,6 +445,7 @@ class VA_Server:
                                             device=self.device,
                                             batch_size = 2 if self.use_cfg else 1
                                             )
+        self._log_timing("reset.create_empty_cache", t_cache, f"latent_tokens={latent_token_per_chunk} action_tokens={action_token_per_chunk}")
 
         self.action_mask = torch.zeros([self.job_config.action_dim]).bool()
         self.action_mask[self.job_config.used_action_channel_ids] = True
@@ -422,6 +460,7 @@ class VA_Server:
         if prompt is None:
             self.prompt_embeds = self.negative_prompt_embeds = None
         else:
+            t_prompt = time.perf_counter()
             self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
                 negative_prompt=None,
@@ -433,13 +472,16 @@ class VA_Server:
                 device=self.device,
                 dtype=self.dtype,
             )
+            self._log_timing("reset.encode_prompt", t_prompt, f"prompt_len={len(prompt)}")
 
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
         os.makedirs(self.exp_save_root, exist_ok=True)
         torch.cuda.empty_cache()
+        self._log_timing("reset.total", t_start, f"prompt={str(prompt)[:80] if prompt is not None else 'None'}")
 
     def _infer(self, obs, frame_st_id=0):
+        t_start = time.perf_counter()
         frame_chunk_size = self.job_config.frame_chunk_size
         if frame_st_id == 0:
             init_latent = self._encode_obs(obs)
@@ -485,6 +527,7 @@ class VA_Server:
                 torch.no_grad(),
         ):
             # 1. Video Generation Loop
+            t_video = time.perf_counter()
             for i, t in enumerate(tqdm(timesteps)):
                 last_step = i == len(timesteps) - 1
                 latent_cond = init_latent[:, :, 0:1].to(
@@ -519,7 +562,9 @@ class VA_Server:
                                                   return_dict=False)
 
                 latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
+            self._log_timing("infer.video_loop", t_video, f"steps={len(timesteps)} frame_st_id={frame_st_id}")
 
+            t_action = time.perf_counter()
             for i, t in enumerate(tqdm(action_timesteps)):
                 last_step = i == len(action_timesteps) - 1
                 action_cond = torch.zeros(
@@ -558,6 +603,7 @@ class VA_Server:
                                                          return_dict=False)
 
                 actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
+            self._log_timing("infer.action_loop", t_action, f"steps={len(action_timesteps)} frame_st_id={frame_st_id}")
 
         actions[:, ~self.action_mask] *= 0
 
@@ -566,6 +612,7 @@ class VA_Server:
 
         actions = self.postprocess_action(actions)
         torch.cuda.empty_cache()
+        self._log_timing("infer.total", t_start, f"frame_st_id={frame_st_id}")
         return actions, latents
 
     def _compute_kv_cache(self, obs):
@@ -623,18 +670,21 @@ class VA_Server:
             return dict(action=action)
     
     def decode_one_video(self, latents, output_type):
-        latents = latents.to(self.vae.dtype)
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
-        latents = latents / latents_std + latents_mean
-        video = self.vae.decode(latents, return_dict=False)[0]
-        video = self.video_processor.postprocess_video(video, output_type=output_type)
+        t_start = time.perf_counter()
+        with torch.no_grad():
+            latents = latents.detach().to(self.vae.dtype)
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean)
+                .view(1, self.vae.config.z_dim, 1, 1, 1)
+                .to(latents.device, latents.dtype)
+            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+                latents.device, latents.dtype
+            )
+            latents = latents / latents_std + latents_mean
+            video = self.vae.decode(latents, return_dict=False)[0]
+            video = self.video_processor.postprocess_video(video, output_type=output_type)
+        self._log_timing("decode_one_video", t_start, f"latents={tuple(latents.shape)}")
         return video
     
     def load_init_obs(self):

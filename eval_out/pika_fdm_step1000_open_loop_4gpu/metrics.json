@@ -1,0 +1,15 @@
+[
+  {
+    "episode_index": 0,
+    "length": 342,
+    "prompt": "left arm pick the apple from the blue board to the middle of the table, then right arm pick the apple and place it into the red box.",
+    "latent_paths": [
+      "/mnt/ceph3/zyh/lerobot_pidata/latents/chunk-000/observation.images.scene/episode_000000_0_342.pth",
+      "/mnt/ceph3/zyh/lerobot_pidata/latents/chunk-000/observation.images.left_wrist/episode_000000_0_342.pth",
+      "/mnt/ceph3/zyh/lerobot_pidata/latents/chunk-000/observation.images.right_wrist/episode_000000_0_342.pth"
+    ],
+    "comparison_video": "eval_out/pika_fdm_step1000_open_loop_4gpu/episode_000000/comparison.mp4",
+    "latent_mse": 0.0006876900442875922,
+    "pred_chunks": 11
+  }
+]

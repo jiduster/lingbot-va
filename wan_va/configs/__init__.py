@@ -9,6 +9,7 @@ from .va_demo_cfg import va_demo_cfg
 from .va_demo_i2va import va_demo_i2va_cfg
 from .va_pika_cfg import va_pika_cfg
 from .va_pika_train_cfg import va_pika_train_cfg
+from .va_pika_fdm_train_cfg import va_pika_fdm_train_cfg
 from .va_pika_merged_train_cfg import va_pika_merged_train_cfg
 
 VA_CONFIGS = {
@@ -22,5 +23,6 @@ VA_CONFIGS = {
     'demo_i2av': va_demo_i2va_cfg,
     'pika': va_pika_cfg,
     'pika_train': va_pika_train_cfg,
+    'pika_fdm_train': va_pika_fdm_train_cfg,
     'pika_merged_train': va_pika_merged_train_cfg,
 }

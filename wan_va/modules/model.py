@@ -100,6 +100,7 @@ class FlexAttnFunc(nn.Module):
         window_size,
         patch_size,
         device,
+        fdm_mode=False,
     ):
         torch._inductor.config.realize_opcount_threshold = 100
         B, _, L_F, L_H, L_W = latent_shape
@@ -112,7 +113,22 @@ class FlexAttnFunc(nn.Module):
 
         latent_frame_id = torch.arange(L_F)[None, :, None, None].expand(B, -1, L_H // patch_size[1], L_W // patch_size[2])[None].flatten()
         action_frame_id = torch.arange(A_F)[None, :, None, None].expand(B, -1, A_H, A_W)[None].flatten()
-        frame_ids = torch.cat([latent_frame_id // chunk_size * 2] * 2 + [action_frame_id // chunk_size * 2 + 1] * 2)
+        latent_frame_block_id = latent_frame_id // chunk_size * 2
+        action_frame_block_id = action_frame_id // chunk_size * 2 + 1
+        condition_action_frame_block_id = action_frame_block_id
+        if fdm_mode:
+            # In the FDM branch, video tokens should predict the visual outcome
+            # after the current action chunk, so clean action tokens from the
+            # same chunk must be visible to noisy video queries.
+            condition_action_frame_block_id = action_frame_id // chunk_size * 2 - 1
+        frame_ids = torch.cat(
+            [
+                latent_frame_block_id,
+                latent_frame_block_id,
+                action_frame_block_id,
+                condition_action_frame_block_id,
+            ]
+        )
 
         noise_ids = torch.cat(
             [
@@ -768,7 +784,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                input_dict["chunk_size"],
                                window_size=input_dict['window_size'],
                                patch_size=self.patch_size,
-                               device=hidden_states.device
+                               device=hidden_states.device,
+                               fdm_mode=input_dict.get("loss_mode") == "fdm",
                                )
 
         for block in self.blocks:
